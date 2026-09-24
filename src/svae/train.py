@@ -17,7 +17,7 @@ from torch import nn
 from torch.nn import functional
 from torch.utils.data import DataLoader, TensorDataset
 
-from .config import Config
+from .config import ARTIFACTS_DIR, Config
 from .simulate import make_parent_dataset, parents_to_graph
 
 
@@ -39,6 +39,8 @@ class TrainingRun:
     data: DataSplits
     history: tuple[dict[str, float], ...]
     best_validation_objective: float
+    selected_epoch: int
+    stopped_early: bool
     elapsed_seconds: float
     device: torch.device
     checkpoint_path: Path | None
@@ -130,11 +132,15 @@ def train(
     *,
     data: DataSplits | None = None,
     device: str | torch.device | None = None,
-    checkpoint_dir: str | Path | None = "artifacts",
+    checkpoint_dir: str | Path | None = ARTIFACTS_DIR,
     report: Callable[[dict[str, float]], None] | None = print,
     show: bool = True,
 ) -> TrainingRun:
     """Train one model and return all state needed by notebook experiments."""
+    if config.early_stopping_patience < 1:
+        raise ValueError("early_stopping_patience must be positive")
+    if config.early_stopping_min_delta < 0:
+        raise ValueError("early_stopping_min_delta must be nonnegative")
     torch.set_num_threads(config.threads)
     random.seed(config.init_seed)
     np.random.seed(config.init_seed)
@@ -182,6 +188,10 @@ def train(
     history: list[dict[str, float]] = []
     best_state = None
     best_objective = float("inf")
+    best_validation_parts: tuple[float, float] | None = None
+    selected_epoch = 0
+    worsening_epochs = 0
+    stopped_early = False
     started = time.perf_counter()
     for epoch in range(config.epochs):
         beta = config.beta * min(1.0, (epoch + 1) / config.warmup_epochs)
@@ -197,13 +207,32 @@ def train(
             "val_recon_query": validation_metrics["reconstruction"] / (config.num_nodes - 2),
             "val_kl_graph": validation_metrics["kl"],
         }
-        history.append(row)
         objective = validation_metrics["reconstruction"] + validation_metrics["kl"]
         if epoch + 1 >= config.warmup_epochs and objective < best_objective:
             best_objective = objective
             best_state = copy.deepcopy(model.state_dict())
+            best_validation_parts = (
+                validation_metrics["reconstruction"], validation_metrics["kl"]
+            )
+            selected_epoch = epoch + 1
+            worsening_epochs = 0
+        elif epoch + 1 >= config.warmup_epochs:
+            assert best_validation_parts is not None
+            both_worsened = all(
+                current > selected + config.early_stopping_min_delta
+                for current, selected in zip(
+                    (validation_metrics["reconstruction"], validation_metrics["kl"]),
+                    best_validation_parts,
+                )
+            )
+            worsening_epochs = worsening_epochs + 1 if both_worsened else 0
+        row["early_stopping_bad_epochs"] = float(worsening_epochs)
+        history.append(row)
         if report is not None:
             report(row)
+        if worsening_epochs >= config.early_stopping_patience:
+            stopped_early = True
+            break
 
     if best_state is None:
         raise RuntimeError("training ended before a model could be selected")
@@ -211,12 +240,15 @@ def train(
     model.eval()
     elapsed = time.perf_counter() - started
     checkpoint_path = _save_checkpoint(
-        model, config, history, best_objective, checkpoint_dir
+        model, config, history, best_objective, selected_epoch, stopped_early,
+        checkpoint_dir,
     )
     if show:
         print(
             f"training seconds: {elapsed:.3f}; "
-            f"selected validation objective/graph: {best_objective:.4f}"
+            f"selected epoch: {selected_epoch}; "
+            f"selected validation objective/graph: {best_objective:.4f}; "
+            f"stopped early: {stopped_early}"
         )
         if checkpoint_path is not None:
             print("saved checkpoint:", checkpoint_path.resolve())
@@ -239,7 +271,8 @@ def train(
         plt.tight_layout()
         plt.show()
     return TrainingRun(
-        config, model, data, tuple(history), best_objective, elapsed,
+        config, model, data, tuple(history), best_objective, selected_epoch,
+        stopped_early, elapsed,
         selected_device, checkpoint_path,
     )
 
@@ -272,7 +305,10 @@ def _run_epoch(
     return {"reconstruction": reconstruction_total / graphs_seen, "kl": kl_total / graphs_seen}
 
 
-def _save_checkpoint(model, config, history, best_objective, checkpoint_dir):
+def _save_checkpoint(
+    model, config, history, best_objective, selected_epoch, stopped_early,
+    checkpoint_dir,
+):
     if checkpoint_dir is None:
         return None
     destination = Path(checkpoint_dir)
@@ -282,5 +318,7 @@ def _save_checkpoint(model, config, history, best_objective, checkpoint_dir):
         "model_state_dict": {name: value.detach().cpu() for name, value in model.state_dict().items()},
         "config": asdict(config), "history": history,
         "best_validation_objective_per_graph": best_objective,
+        "selected_epoch": selected_epoch,
+        "stopped_early": stopped_early,
     }, path)
     return path

@@ -369,6 +369,30 @@ The **degree distribution** answers: if we choose one node uniformly from a comp
 the probability it has 1 edge, 2 edges, 3 edges, and so on? The symbol \(p_k\) means the probability
 of degree \(k\); it is not a parent-selection probability.
 
+For each collection (NetworkX, VAE, and the independent baseline), replay each parent array to obtain
+the degrees in its **completed** graph. If graph \(g\) has \(N_{g,k}\) nodes of degree \(k\), and the
+collection has \(G\) graphs of \(N\) nodes each, the plotted empirical probability mass function is
+
+$$
+\widehat p_k=\frac{1}{GN}\sum_{g=1}^{G}N_{g,k}.
+$$
+
+This is the fraction of all completed-graph nodes in that collection that have degree \(k\). It is
+also the average of the per-graph degree fractions, since the graphs all have the same size. The PMF
+plot has node degree \(k\) on the horizontal axis and \(\widehat p_k\) on the vertical axis.
+
+The complementary cumulative distribution function (CCDF) uses those **same** counts:
+
+$$
+\widehat P(D\ge k)=\sum_{j\ge k}\widehat p_j.
+$$
+
+Its horizontal axis is the threshold \(k\), and its vertical axis is the fraction of nodes with at
+least \(k\) edges. The PMF and CCDF contain the same information; the CCDF collects sparse high-degree
+bins into a tail probability, making that part easier to read. Neither plot uses the attachment
+probabilities from the previous section. Both plots use a logarithmic vertical scale so small tail
+fractions can be compared; zero fractions cannot appear on a log scale.
+
 For the conventional BA model with \(m=1\), the asymptotic degree distribution is
 
 $$
@@ -387,7 +411,11 @@ $$
 p_k=\frac{2m(m+1)}{k(k+1)(k+2)}.
 $$
 
-This exact asymptotic form is more informative than fitting a straight line to a log-log plot. The
+This is the limiting BA degree fraction as graph size grows, not the exact expected fraction for a
+64-node graph. It appears as a dashed reference on the PMF plot. Equal-sized NetworkX samples are the
+primary practical comparison for the VAE, and the exact finite-size recurrence below provides a
+mathematical comparison at \(N=64\). This asymptotic form is more informative than fitting a straight
+line to a log-log plot. The
 derivation appears in the [Albert and Barabási review](https://www.barabasi.com/media/pub_imports/files/103.pdf).
 
 Compare:
@@ -402,6 +430,21 @@ Compare:
 At \(N=64\), the asymptotic law is not the true finite-size target. Equal-sized NetworkX samples
 should remain the primary reference, with the asymptotic formula used as a secondary convergence
 check.
+
+The third plot summarizes a different quantity: for each completed graph, record its largest node
+degree, then plot the fraction of graphs with each possible maximum. Its horizontal axis is maximum
+degree **per graph**, and its vertical axis is fraction of graphs. Two methods can have nearly identical
+pooled PMFs but different maximum-degree distributions: the pooled PMF loses information about how
+high-degree nodes are grouped within individual graphs.
+
+The implementation also reports \(\widehat P(D\ge5)\) and \(\widehat P(D\ge10)\) as tail masses,
+the degree-1 through degree-3 counts for each graph, and total variation distance
+\(\frac12\sum_k|\widehat p_k^{\mathrm{method}}-\widehat p_k^{\mathrm{NetworkX}}|\).
+A tail mass of 0.021 at threshold 10 means about 2.1% of completed-graph nodes have degree at least
+10. Total variation (TV) summarizes the gap between two PMFs: for example, TV of 0.04 means about
+4% of probability mass would need to move between degree bins to make the pooled distributions match.
+TV is zero for NetworkX by definition; smaller values mean closer pooled degree distributions, but do
+not establish that the methods generate the same whole-graph distribution.
 
 
 **Question:** Does a uniformly selected generated node have the same degree distribution as a BA node?
@@ -465,7 +508,17 @@ $$
 
 Plot residuals by degree with uncertainty across graphs. NetworkX should fluctuate around zero, which
 also checks that the recurrence matches our simulator convention. VAE residuals show exactly where it
-moved degree mass.
+puts more or fewer nodes than BA expects **per completed graph**. For example, a residual of +2 at
+degree 2 means two extra degree-2 nodes on average in a 64-node graph, or 2/64 = 3.125 percentage
+points more nodes in that bin. A negative residual at degree 1 means too few leaves. Because every
+graph has 64 nodes and 63 edges, residuals must sum to zero both as node counts and when weighted by
+degree; positive low-degree residuals are balanced elsewhere.
+
+The plot focuses on degrees 1 through 15. At higher degrees, expected counts per exact degree are
+small, so a line near zero can hide meaningful differences in how often graphs form hubs. Use the
+maximum-degree distribution and cumulative tail mass above for that question. This residual plot is
+most useful for locating low-degree discrepancies and checking the finite-size recurrence against
+NetworkX; it does not, by itself, identify the attachment mechanism.
 
 ## 4. Degree growth by node age
 
@@ -504,15 +557,29 @@ degree distributions and their scaling limits are studied by
 early arrivals?
 
 For every arrival ID \(i\), collect its final degree across graphs. Compare NetworkX and VAE means,
-standard deviations, and quantile bands. The existing mean curve can look excellent even if VAE
-variation is too small. Also plot
+standard deviations, and quantiles. The mean curve can look excellent even if VAE variation is too
+small. The displayed comparison focuses on two readable views:
+
+- For the first ten arrival IDs, plot mean final degree **minus the exact BA expectation**. Error bars
+  are approximate 95% intervals for each estimated mean across independently generated graphs. Zero
+  means agreement in the mean; an interval crossing zero gives little evidence of a difference at
+  that node. These intervals are not the spread of individual graph outcomes.
+- For node 1, plot the empirical cumulative distribution of its final degree. At degree \(d\), the
+  vertical value is the fraction of graphs in which node 1 finishes with at most \(d\) edges. A curve
+  shifted left indicates a less dominant root; differences in steepness show differences in
+  graph-to-graph variability.
+
+The function also returns the full per-node means, standard deviations, quantiles, mean trajectories,
+and rescaled degrees for further inspection. The rescaling is
 
 $$
 D_i(N)\sqrt{\frac{i}{N}}.
 $$
 
 The square-root age law predicts that this rescaling should reduce the systematic dependence on
-arrival ID. A remaining upward or downward trend reveals an age-scaling mismatch.
+arrival ID. A remaining upward or downward trend reveals an age-scaling mismatch, but values for late
+arrivals tend toward one because those nodes had little time to gain edges. It is therefore not a
+useful standalone plot for this 64-node comparison.
 
 ## 5. Reinforcement and temporal dependence
 
@@ -551,8 +618,20 @@ y=D_3(64)-D_3(32).
 $$
 
 Correlate \(x\) and \(y\) across graphs. Repeat for nodes 1 through 10 and split points 16, 32, and 48.
-Compare VAE-minus-NetworkX errors in a heatmap with bootstrap intervals. A match only for node 1 would
-suggest limited coordination; broad agreement would be much stronger evidence.
+Here, **split time 32** means pause after the graph has grown to 32 nodes, record each selected node's
+current degree, then count how many additional edges it receives while nodes 33 through 64 arrive.
+Splits 16 and 48 divide the same 64-node growth process earlier and later. Each heatmap row is one
+node arrival ID, and each column is one split time. A cell's correlation is calculated **across
+graphs**, comparing that node's degree at the split with its later gain.
+
+The NetworkX panel shows the correlation itself: red means graphs where that node was ahead at the
+split tend to give it more later edges. The VAE and independent panels show their correlation **minus
+the NetworkX correlation** at the same node and split. White means close to NetworkX; blue means
+weaker correlation; red means stronger correlation. Thus red NetworkX and white VAE are consistent
+with the VAE reproducing positive reinforcement, while a blue independent panel indicates missing
+reinforcement. Color alone does not establish statistical significance; inspect the returned
+graph-bootstrap intervals for uncertainty. A match only for node 1 would suggest limited
+coordination; broad agreement would be much stronger evidence.
 
 ### Conditional future growth
 
@@ -581,7 +660,9 @@ $$
 
 Plot future gain against \(k\), including bin counts and uncertainty. A flat VAE curve indicates
 missing reinforcement. An overly steep curve means early advantages compound too strongly. Compare
-the complete curve rather than reducing it to one slope.
+the complete curve rather than reducing it to one slope. Display the first ten nodes in a compact
+multi-row grid with one shared method legend; each panel is one node, and an asterisk marks a degree
+bin with fewer than the required number of graphs.
 
 ### Attachment residuals
 
@@ -726,6 +807,12 @@ $$
 Repeat this for several early candidate parents. The independent-parent baseline should fail this test
 by construction.
 
+These are rare events for late arrival pairs. In the 64-node notebook run, asking whether both nodes
+32 and 64 chose the same parent yielded only 0–6 joint observations per parent across 2,048 graphs,
+below the plot's minimum of 20. Those ratios are too unstable to interpret, so the notebook instead
+uses arrival pairs (8, 16) and (8, 24) with parents 1 and 2. The plot omits ratios below the
+minimum and reports their joint counts; an empty plot should explicitly say when no event qualifies.
+
 
 **Question:** Do two separately queried arrivals choose the same hub together more often than their
 individual frequencies imply?
@@ -767,6 +854,12 @@ Calculate maximum-hub edge share, top-five edge share, Herfindahl concentration,
 for each graph. This produces scalar distributions to compare with NetworkX. High Herfindahl values
 mean concentration in a small number of nodes. Two generators can have the same maximum degree while
 one has several secondary hubs and the other does not.
+
+Each histogram's horizontal axis is that graph-level metric, and its vertical axis is the fraction of
+graphs in a metric bin. All methods use the same bins within a panel. The first two metrics are edge
+fractions between 0 and 1. Herfindahl is a unitless sum of squared **degree** shares; entropy is
+\(-\sum_i (d_i/2E)\log(d_i/2E)\) in nats. Larger Herfindahl and smaller entropy both indicate that
+degree is more concentrated among a few nodes.
 
 ## 8. Tree-specific geometry
 
@@ -921,11 +1014,35 @@ Low entropy alone is not evidence of useful latent information: the decoder migh
 same popular node. It becomes evidence of graph-specific commitment only when the preferred parent
 changes meaningfully across latents.
 
+The middle plot's **mode disagreement** is \(1-\sum_j f_j^2\), where \(f_j\) is the fraction of latent
+seeds for which candidate parent \(j\) has the largest decoder probability. Equivalently, it is the
+estimated chance that two independently selected seeds have different most-likely parents for the
+same arrival. A value of 0.8 therefore means about 80% of seed pairs disagree on the argmax; it does
+not mean the decoder makes an 80%-confident choice. As the arrival gets later, there are more eligible
+parents, so disagreement can rise even without stronger latent influence.
+
+The right plot sums the **variance across seeds** of each eligible parent's probability:
+
+$$
+V_t=\sum_{j<t}\operatorname{Var}_z[p(j\mid z,t)].
+$$
+
+This is the average squared distance between a seed's probability vector and the mean probability
+vector. A decline means the full vectors move less in absolute probability as the arrival gets later.
+Some decline is expected mechanically because probability mass is divided among more candidate
+parents. High mode disagreement can coexist with low total variance when small probability changes
+swap which candidate ranks first. Neither plot alone establishes that the latent produces the correct
+BA dependence; compare generated-graph statistics and conditional behavior as well.
+
 ### Latent predictability
 
 A **probe** is a deliberately simple model trained after the VAE. It receives \(z\) and attempts to
 predict a graph property. The VAE is frozen. This asks whether information about that property is easy
 to read from the latent; it does not alter generation or prove that the latent causally controls it.
+The public seed also determines separate random draws for each parent query. Consequently, \(z\)
+specifies decoder probabilities and shared tendencies, but does not uniquely determine the sampled
+graph or its exact maximum degree, leaf fraction, or diameter. This probe is an optional diagnostic
+of predictability from \(z\) alone, not a pass/fail criterion for seeded graph generation.
 
 Train simple held-out probes from \(z\) to:
 
@@ -946,6 +1063,25 @@ Split latent/property pairs into probe-training and probe-test sets. Fit simple 
 scalar properties and logistic regression for leader identity. Compare held-out \(R^2\) or accuracy
 with trivial baselines. Strong prediction means a property is easily accessible in \(z\). Weak linear
 prediction does not prove absence because the representation may be nonlinear.
+
+The regression score on the held-out graphs is
+
+$$
+R^2=1-\frac{\sum_g(y_g-\widehat y_g)^2}{\sum_g(y_g-\overline y_{\mathrm{test}})^2}.
+$$
+
+A score of 1 is perfect, 0 matches the test-set mean predictor, and negative values mean worse squared
+error than predicting that mean. For example, \(R^2=-3\) means four times the squared error of the
+test-set mean predictor. The plotted baseline instead predicts the **training-set** mean, so its
+held-out score is usually near zero but need not equal zero exactly. In this notebook, strongly
+negative maximum-degree, leaf-fraction, and diameter scores mean the fitted linear probe predicts
+those realized graph properties badly on unseen seeds, worse than the simple baseline. This can
+reflect weak linear information, decoder sampling noise, or an unstable fit; sampling noise alone does
+not explain why the probe performs worse than the baseline. The fixed-latent experiment above is a
+more direct test of whether changing \(z\) changes a graph property's **conditional mean** or
+distribution. These scores do not establish that \(z\) contains no information about those properties.
+Leader identity uses classification
+**accuracy**, the fraction predicted correctly, and appears on its own axis because it is not \(R^2\).
 
 ## 11. Distribution-level comparisons
 

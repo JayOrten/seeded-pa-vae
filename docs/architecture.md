@@ -61,6 +61,15 @@ implausible graph. The experiment therefore evaluates whole sampled collections,
 accuracy. A later variant could use deterministic argmax so all diversity resides in `z`, but that is
 a different generative model.
 
+## Model selection and early stopping
+
+Validation uses fixed latent noise so changes between epochs reflect model changes rather than a new
+Monte Carlo draw. Checkpoint selection begins after KL warmup and minimizes validation reconstruction
+plus KL loss. Training stops when both validation components are worse than the selected checkpoint
+for `early_stopping_patience` consecutive epochs (10 by default). An epoch where either component is
+within `early_stopping_min_delta` of the selected value resets the counter. The selected checkpoint is
+restored before evaluation, and the run records its epoch and whether training stopped early.
+
 ## Computational accounting
 
 The public method recomputes a small latent and evaluates a dense `N`-class head. It avoids replaying
@@ -68,4 +77,3 @@ prior attachments, but its work is not constant with graph size because the outp
 `N`. Full-graph generation calls the scalar method for every node. Any future claim about efficiency
 must include latent construction, candidate scoring, hierarchy expansion, local refinement, and cache
 warmup.
-

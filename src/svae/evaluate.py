@@ -40,23 +40,28 @@ GraphCollections = Mapping[str, Sequence[nx.Graph]]
 
 
 def reconstruction_experiment(
-    run: TrainingRun, *, show: bool = True
+    run: TrainingRun, *, batch_size: int = 256, show: bool = True
 ) -> dict[str, object]:
     """Report mean-latent reconstruction accuracy on the held-out test split."""
     model = run.model
     model.eval()
+    # Batched: a whole large test split at once costs gigabytes of one-hot and
+    # decoder activations for two scalar averages.
+    queries = torch.arange(3, run.config.num_nodes + 1, device=run.device)
+    cross_entropy_total = correct = predictions = 0.0
     with torch.no_grad():
-        test_parents = run.data.test.to(run.device)
-        latent_mean, _ = model.encode(test_parents)
-        _, masked_logits, _ = model.decode(
-            latent_mean,
-            torch.arange(3, run.config.num_nodes + 1, device=run.device),
-        )
-        target_parents = test_parents[:, 2:] - 1
-        cross_entropy = functional.cross_entropy(
-            masked_logits.flatten(0, 1), target_parents.flatten(), reduction="mean"
-        ).item()
-        accuracy = (masked_logits.argmax(-1) == target_parents).float().mean().item()
+        for start in range(0, len(run.data.test), batch_size):
+            test_parents = run.data.test[start : start + batch_size].to(run.device)
+            latent_mean, _ = model.encode(test_parents)
+            _, masked_logits, _ = model.decode(latent_mean, queries)
+            target_parents = test_parents[:, 2:] - 1
+            cross_entropy_total += functional.cross_entropy(
+                masked_logits.flatten(0, 1), target_parents.flatten(), reduction="sum"
+            ).item()
+            correct += (masked_logits.argmax(-1) == target_parents).sum().item()
+            predictions += target_parents.numel()
+    cross_entropy = cross_entropy_total / predictions
+    accuracy = correct / predictions
 
     result = {
         "mean_latent_test_parent_accuracy": accuracy,
@@ -76,7 +81,11 @@ def graph_samples_experiment(
     seeds: Iterable[int] | None = None,
     show: bool = True,
 ) -> dict[str, list[nx.Graph]]:
-    """Generate the three original graph collections and display sample graphs."""
+    """
+    Generate the three original graph collections and display sample graphs.
+
+    This function simulates graphs for each method, across all of the seeds provided.
+    """
     if seeds is None:
         seeds = range(3_000_000, 3_000_000 + run.config.generated_graphs)
     seeds = tuple(seeds)
@@ -441,6 +450,7 @@ def ba_sequence_likelihood_experiment(
                 np.sort(values), np.arange(1, len(values) + 1) / len(values), label=name
             )
             print(name, result[name]["summary"])
+            print(name, "Wasserstein distance to NetworkX:", result[name]["wasserstein"])
         plt.xlabel(
             "BA log probability / arrival"
             if normalize_per_arrival
@@ -476,17 +486,17 @@ def attachment_kernel_experiment(
     ):
         raise ValueError("alpha_grid must contain increasing finite values")
     result = {}
-    for name, arrays in parents.items():
+    for name, arrays in parents.items(): # for each completed candidate
         likelihood = np.zeros((len(arrays), len(grid)))
-        for row, array in enumerate(arrays):
-            for degrees, parent in _arrivals(array):
+        for row, array in enumerate(arrays): # for each completeld graph
+            for degrees, parent in _arrivals(array): # replay each graph one arrival at a time
                 weights = grid[:, None] * np.log(degrees)
                 likelihood[row] += weights[:, parent] - logsumexp(weights, axis=1)
         total = likelihood.sum(0)
         estimate = float(grid[total.argmax()])
         interval = _bootstrap(
             likelihood, lambda x: grid[x.sum(0).argmax()], bootstrap_samples
-        )
+        ) # estimate uncertainty by repeatedly resampling whole graph rows.
         result[name] = {
             "alpha": estimate,
             "alpha_grid": grid,
@@ -594,14 +604,27 @@ def degree_distribution_experiment(
             axes[1].plot(range(1, n), row["ccdf"][1:], label=name)
             axes[2].hist(
                 row["max_degrees"],
-                bins="auto",
-                density=True,
+                bins=np.arange(0.5, n + 0.5, 1),
+                weights=np.full(len(row["max_degrees"]), 1 / len(row["max_degrees"])),
                 histtype="step",
                 label=name,
             )
-            print(name, "TV:", row["total_variation"], "tail mass:", row["tail_mass"])
+            print(
+                name,
+                "PMF total variation vs NetworkX:",
+                row["total_variation"],
+                "node fractions with degree >= threshold:",
+                row["tail_mass"],
+            )
         k = np.arange(1, n)
         axes[0].plot(k, 4 / (k * (k + 1) * (k + 2)), "k--", label="Asymptotic BA")
+        axes[0].set(xlabel="Node degree k", ylabel="Fraction of nodes with degree k")
+        axes[1].set(xlabel="Degree threshold k", ylabel="Fraction of nodes with degree ≥ k")
+        axes[2].set(xlabel="Maximum degree in a graph", ylabel="Fraction of graphs")
+        largest_observed_degree = max(row["max_degrees"].max() for row in result.values())
+        for axis in axes[:2]:
+            axis.set_yscale("log")
+            axis.set_xlim(1, largest_observed_degree)
         for axis, title in zip(axes, ("Degree PMF", "Degree CCDF", "Maximum degree")):
             axis.set_title(title)
             axis.legend()
@@ -654,6 +677,9 @@ def finite_size_degree_counts_experiment(
         plt.axhline(0, color="black", linestyle="--")
         plt.xlabel("Degree")
         plt.ylabel("Mean count minus exact BA expectation")
+        # High-degree expected counts are tiny at this graph size; show the
+        # low-degree bins where count residuals are interpretable.
+        plt.xlim(1, min(num_nodes - 1, 15))
         plt.legend()
         plt.show()
     return result
@@ -678,6 +704,8 @@ def degree_by_age_experiment(
     """
     parents = _parent_collections(collections)
     n = len(next(iter(parents.values()))[0])
+    if early_nodes < 1:
+        raise ValueError("early_nodes must be positive")
     expected = np.zeros(n)
     expected[:2] = 1
     for size in range(2, n):
@@ -697,30 +725,44 @@ def degree_by_age_experiment(
             "rescaled_degrees": degrees * np.sqrt(np.arange(1, n + 1) / n),
         }
     if show:
-        _, axes = plt.subplots(1, 3, figsize=(14, 4))
-        for name, row in result.items():
-            axes[0].plot(range(1, n + 1), row["mean"], label=name)
-            axes[0].fill_between(
-                range(1, n + 1), row["quantiles"][0], row["quantiles"][2], alpha=0.12
+        _, axes = plt.subplots(1, 2, figsize=(11, 4))
+        selected_nodes = np.arange(1, min(early_nodes, n) + 1)
+        offsets = np.linspace(-0.2, 0.2, len(result))
+        for offset, (name, row) in zip(offsets, result.items()):
+            # The interval describes uncertainty in the estimated mean, not
+            # the much wider spread of degrees across individual graphs.
+            sample_count = len(row["early_degrees"])
+            mean_error = 1.96 * row["sd"][: len(selected_nodes)] / np.sqrt(sample_count)
+            axes[0].errorbar(
+                selected_nodes + offset,
+                row["mean"][: len(selected_nodes)] - expected[: len(selected_nodes)],
+                yerr=mean_error,
+                fmt="o",
+                capsize=2,
+                label=name,
             )
-            axes[1].plot(range(1, n + 1), row["rescaled_degrees"].mean(0), label=name)
-            for node in range(min(early_nodes, n)):
-                axes[2].plot(
-                    range(max(2, node + 1), n + 1),
-                    row["mean_trajectories"][max(2, node + 1) - 2 :, node],
-                    label=f"{name}: {node + 1}",
-                )
-        axes[0].plot(range(1, n + 1), expected, "k--", label="Exact expectation")
-        for axis, title in zip(
-            axes,
-            (
-                "Degree vs arrival (95% sample band)",
-                "Age-rescaled degree",
-                "Early-node trajectories",
-            ),
-        ):
-            axis.set_title(title)
-            axis.legend(fontsize=6)
+            root_degrees = np.sort(row["early_degrees"][:, 0])
+            axes[1].step(
+                root_degrees,
+                np.arange(1, sample_count + 1) / sample_count,
+                where="post",
+                label=name,
+            )
+        axes[0].axhline(0, color="black", linestyle="--", linewidth=1)
+        axes[0].set(
+            title="Early-node mean degree vs exact BA",
+            xlabel="Node arrival ID",
+            ylabel="Mean final degree minus BA expectation",
+            xticks=selected_nodes,
+        )
+        axes[1].set(
+            title="Final degree of node 1",
+            xlabel="Node 1 final degree",
+            ylabel="Fraction of graphs at or below degree",
+            ylim=(0, 1),
+        )
+        for axis in axes:
+            axis.legend()
         plt.tight_layout()
         plt.show()
     return result
@@ -787,18 +829,20 @@ def reinforcement_experiment(
             )
             plot = axis.imshow(matrix, vmin=-1, vmax=1, cmap="coolwarm", aspect="auto")
             axis.set(
-                title=name,
+                title=("NetworkX correlation" if name == "NetworkX" else f"{name} − NetworkX"),
                 xticks=range(len(splits)),
                 xticklabels=splits,
                 yticks=range(len(nodes)),
                 yticklabels=nodes + 1,
-                xlabel="Split time",
-                ylabel="Node",
+                xlabel="Split after this many nodes",
+                ylabel="Node arrival ID",
             )
-            plt.colorbar(plot, ax=axis)
-        plt.suptitle(
-            "Reinforcement: reference correlation; other panels show reference error"
-        )
+            plt.colorbar(
+                plot,
+                ax=axis,
+                label="Correlation" if name == "NetworkX" else "Correlation difference",
+            )
+        plt.suptitle("Early degree versus later degree gain")
         plt.tight_layout()
         plt.show()
     return result
@@ -845,10 +889,12 @@ def conditional_future_growth_experiment(
             result[name][int(node + 1)] = bins
     if show:
         eligible = nodes[nodes + 1 <= split] + 1
-        _, axes = plt.subplots(
-            1, len(eligible), squeeze=False, figsize=(4 * len(eligible), 4)
+        columns = min(3, len(eligible))
+        rows = (len(eligible) + columns - 1) // columns
+        figure, axes = plt.subplots(
+            rows, columns, squeeze=False, figsize=(4.5 * columns, 3.5 * rows)
         )
-        for axis, node in zip(axes[0], eligible):
+        for axis, node in zip(axes.flat, eligible):
             for name, rows in result.items():
                 bins = rows[node]
                 means = np.array([v["mean_gain"] for v in bins.values()])
@@ -866,8 +912,11 @@ def conditional_future_growth_experiment(
                 xlabel=f"Degree at {split}",
                 ylabel="Future gain",
             )
-            axis.legend()
-        plt.tight_layout()
+        for axis in list(axes.flat)[len(eligible) :]:
+            axis.set_visible(False)
+        handles, labels = axes.flat[0].get_legend_handles_labels()
+        figure.legend(handles, labels, loc="upper center", ncol=len(labels))
+        figure.tight_layout(rect=(0, 0, 1, 0.96))
         plt.show()
     return result
 
@@ -1125,18 +1174,34 @@ def joint_attachment_experiment(
             }
     if show:
         plt.figure(figsize=(max(8, len(events)), 4))
+        any_reliable = False
         for name, rows in result.items():
             # Sparse ratios remain in returned data but are omitted from inference plots.
+            any_reliable |= any(v["reliable"] for v in rows.values())
             plt.plot(
                 range(len(events)),
                 [v["ratio"] if v["reliable"] else np.nan for v in rows.values()],
                 ".-",
                 label=name,
             )
-            print(name, rows)
+            print(
+                name,
+                "joint counts:",
+                {event: row["joint_count"] for event, row in rows.items()},
+            )
+        if not any_reliable:
+            plt.text(
+                0.5,
+                0.5,
+                f"No event reached {minimum_event_count} joint observations",
+                transform=plt.gca().transAxes,
+                ha="center",
+                va="center",
+            )
         plt.xticks(range(len(events)), [str(e) for e in events], rotation=60)
         plt.axhline(1, color="black", linestyle="--")
-        plt.ylabel("Joint / independent probability (s, t, parent)")
+        plt.xlabel("Event (first arrival, second arrival, parent)")
+        plt.ylabel("Joint / product of marginal probabilities")
         plt.legend()
         plt.tight_layout()
         plt.show()
@@ -1186,13 +1251,26 @@ def hub_concentration_experiment(
             metrics[key][name] = np.asarray(rows)[:, column]
     result = {key: _scalar_comparison(values) for key, values in metrics.items()}
     if show:
-        _, axes = plt.subplots(1, 4, figsize=(16, 4))
+        _, axes = plt.subplots(1, 4, figsize=(18, 4.5))
+        axis_labels = {
+            "largest_hub_edge_share": "Edges incident to largest hub / all edges",
+            "top_k_edge_share": f"Edges incident to top {top_k} nodes / all edges",
+            "herfindahl": "Herfindahl degree concentration",
+            "degree_entropy": "Degree-share entropy (nats)",
+        }
         for axis, (key, values) in zip(axes, metrics.items()):
+            # Use the same bins for each method so their histogram heights
+            # represent comparable fractions of graphs.
+            bins = np.histogram_bin_edges(np.concatenate(list(values.values())), bins="auto")
             for name, samples in values.items():
                 axis.hist(
-                    samples, bins="auto", density=True, histtype="step", label=name
+                    samples,
+                    bins=bins,
+                    weights=np.full(len(samples), 1 / len(samples)),
+                    histtype="step",
+                    label=name,
                 )
-            axis.set_title(key)
+            axis.set(xlabel=axis_labels[key], ylabel="Fraction of graphs per bin")
             axis.legend()
         plt.tight_layout()
         plt.show()
@@ -1473,6 +1551,13 @@ def decoder_entropy_experiment(
         axes[0].plot(queries, np.log(np.array(queries) - 1), "k--", label="Uniform")
         axes[0].legend()
         axes[1].plot(queries, [v["mode_disagreement"] for v in result.values()])
+        axes[1].plot(
+            queries,
+            1 - 1 / (np.array(queries) - 1),
+            "k--",
+            label="Uniform modes (maximum)",
+        )
+        axes[1].legend()
         axes[2].plot(
             queries, [v["probability_variance"].sum() for v in result.values()]
         )
@@ -1485,6 +1570,9 @@ def decoder_entropy_experiment(
             ),
         ):
             axis.set(title=title, xlabel="Arrival")
+        axes[0].set_ylabel("Parent-choice entropy (nats)")
+        axes[1].set_ylabel("Chance two seeds have different argmax")
+        axes[2].set_ylabel("Sum of probability variances across seeds")
         plt.tight_layout()
         plt.show()
     return result
@@ -1540,18 +1628,33 @@ def latent_predictability_experiment(
             "prediction": prediction,
         }
     if show:
-        x = np.arange(len(result))
-        plt.figure(figsize=(12, 4))
-        plt.bar(x - 0.2, [v["score"] for v in result.values()], 0.4, label="Probe")
-        plt.bar(
+        _, axes = plt.subplots(1, 2, figsize=(13, 4))
+        regression = {name: row for name, row in result.items() if row["metric"] == "R2"}
+        x = np.arange(len(regression))
+        axes[0].bar(x - 0.2, [row["score"] for row in regression.values()], 0.4, label="Probe")
+        axes[0].bar(
             x + 0.2,
-            [v["baseline_score"] for v in result.values()],
+            [row["baseline_score"] for row in regression.values()],
             0.4,
-            label="Trivial baseline",
+            label="Training-mean baseline",
         )
-        plt.xticks(x, list(result), rotation=45, ha="right")
-        plt.ylabel("Held-out R2 (leader: accuracy)")
-        plt.legend()
+        axes[0].axhline(0, color="black", linewidth=1)
+        axes[0].set(
+            title="Graph properties predicted from latent",
+            ylabel="Held-out R² (higher is better; can be negative)",
+        )
+        axes[0].set_xticks(x, regression, rotation=45, ha="right")
+        leader = result["leader_id"]
+        axes[1].bar(
+            ["Probe", "Most-frequent baseline"],
+            [leader["score"], leader["baseline_score"]],
+        )
+        axes[1].set(
+            title="Final leader predicted from latent",
+            ylabel="Held-out accuracy (fraction correct)",
+            ylim=(0, 1),
+        )
+        axes[0].legend()
         plt.tight_layout()
         plt.show()
     return result

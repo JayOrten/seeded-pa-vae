@@ -1,6 +1,9 @@
 """Experiment configuration profiles."""
 
 from dataclasses import dataclass
+from pathlib import Path
+
+ARTIFACTS_DIR = Path(__file__).resolve().parents[2] / "artifacts"
 
 
 @dataclass(frozen=True)
@@ -20,6 +23,8 @@ class Config:
     lr: float = 1e-3
     beta: float = 1.0
     warmup_epochs: int = 10
+    early_stopping_patience: int = 10
+    early_stopping_min_delta: float = 0.0
     init_seed: int = 20260909
     threads: int = 8
 
@@ -54,10 +59,10 @@ PROFILES = {
     # 16x the demo training data, a wider model, and over 3x the epochs.
     "large": Config(
         profile="large",
-        num_nodes=64,
+        num_nodes=256,
         latent_dim=128,
         hidden=512,
-        train_graphs=32_768,
+        train_graphs=65_536,
         val_graphs=4_096,
         test_graphs=4_096,
         generated_graphs=2_048,
@@ -67,4 +72,3 @@ PROFILES = {
         threads=8,
     ),
 }
-

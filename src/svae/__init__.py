@@ -1,6 +1,6 @@
 """Seeded preferential-attachment VAE experiments."""
 
-from .config import PROFILES, Config
+from .config import ARTIFACTS_DIR, PROFILES, Config
 from .evaluate import (
     graph_samples_experiment,
     graph_statistics_experiment,
@@ -16,6 +16,7 @@ from .generate import (
 from .train import DataSplits, QueryVAE, TrainingRun, train
 
 __all__ = [
+    "ARTIFACTS_DIR",
     "Config",
     "DataSplits",
     "IndependentParentGenerator",
