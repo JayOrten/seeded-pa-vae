@@ -81,8 +81,8 @@ Two facts about random walks make the skipping possible:
 
 ### Conventions
 
-- **Grid.** A square `int32` array `grid[x, y]` of side `L`, filled with -1. An occupied square holds
-  its particle's arrival index. The center square is `(c, c)` with `c = L // 2`.
+- **Grid.** A square `int32` array `grid[x, y]` of side `L`, filled with 0. An occupied square holds
+  its particle's arrival ID, which starts at 1. The center square is `(c, c)` with `c = L // 2`.
 - **Directions.** Encode as integers with lookup arrays:
 
   | code | name  | `DX` | `DY` |
@@ -95,8 +95,9 @@ Two facts about random walks make the skipping possible:
   With this ordering the opposite direction of `d` is `d ^ 1` (0↔1, 2↔3).
 - **Direction label.** `direction[t]` is the side of the parent the new particle sits on:
   `(x_t, y_t) = (x_parent + DX[d], y_parent + DY[d])`.
-- **Arrival index.** Particle 0 is the seed, with `parent[0] = -1` and `direction[0] = -1`. Particles
-  are numbered in the order they stick.
+- **Arrival IDs.** This follows the BA parent-array convention. Particles are numbered 1, 2, 3, ...
+  in the order they stick. Array index `i` holds particle `i + 1`, and `parent[i]` holds the parent's
+  arrival ID (1-based). The seed particle is ID 1, with `parent[0] = -1` and `direction[0] = -1`.
 - **Cluster radius.** `r_max` is the largest distance from the center to any particle, as a float.
   Starts at 0. Update it every time a particle sticks.
 
@@ -157,7 +158,7 @@ Details for each part:
 - **Stick.** Collect the occupied neighbors: for each direction `k`, look at
   `(x + DX[k], y + DY[k])`. If there is more than one, pick one uniformly at random. Call its direction
   from the walker `k`. Then `parent[i] = grid[x + DX[k], y + DY[k]]` and `direction[i] = k ^ 1`, since
-  the new particle is on the opposite side of the parent. Set `grid[x, y] = i`, store `xs[i] = x`,
+  the new particle is on the opposite side of the parent. Set `grid[x, y] = i + 1`, store `xs[i] = x`,
   `ys[i] = y`, and set `r_max = max(r_max, distance from (x, y) to center)`.
 - **Walkers never land on a particle.** A walker next to a particle sticks before it can step onto it,
   and jumps never land within 2 of a particle. So no occupied-square check is needed when moving.
@@ -207,7 +208,7 @@ especially in the empty gaps between branches. A coarse grid lets walkers jump t
 Before training on its output:
 
 1. **Repeatability.** Same seed gives identical arrays. Different seeds give different arrays.
-2. **Structure.** `parent[0] == -1`. For `t >= 1`, `0 <= parent[t] < t`. `rebuild_positions` matches
+2. **Structure.** `parent[0] == -1`. For `i >= 1`, `1 <= parent[i] <= i`. `rebuild_positions` matches
    `xs, ys` exactly. No two particles share a square. Every particle is exactly one square from its
    parent.
 3. **Fractal dimension.** Take the first `k` particles of a cluster for many `k` (for example 50 values

@@ -1,7 +1,11 @@
+import math
+import os
+from multiprocessing import Pool
+
 import numpy as np
+import torch
 from numpy.typing import NDArray
 from numba import njit
-import math
 # Representations of the DLA graph:
 # list[(x,y) coordinates on grid] - I don't know if we'll even need this one, except for display
 # list[(parent, direction)] - direction is one of four directions, parent is the arrival id of the parent node
@@ -15,7 +19,7 @@ LAUNCH_MARGIN = 5  # walkers start on a circle of radius r_max + LAUNCH_MARGIN
 KILL_FACTOR = 20  # relaunch walkers that get farther than KILL_FACTOR * launch radius
 
 
-@njit
+@njit(cache=True)  # cached so worker processes skip recompiling
 def simulate_dla(
     num_nodes: int, simulator_seed: int
 ) -> tuple[NDArray[np.int32], NDArray[np.int8]]:
@@ -93,6 +97,66 @@ def simulate_dla(
     return parents, directions
 
 
+def _simulate_one(task: tuple[int, int]) -> tuple[NDArray[np.int32], NDArray[np.int8]]:
+    return simulate_dla(*task)
+
+
+def make_dataset(
+    num_nodes: int, num_graphs: int, *, first_seed: int, processes: int | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Simulate consecutive seeds and return ``(parents, directions)`` tensors of shape (graphs, nodes).
+
+    Seeds run in separate processes because Numba's random state is per thread.
+    """
+    if num_graphs < 1:
+        raise ValueError("num_graphs must be positive")
+    tasks = [(num_nodes, first_seed + offset) for offset in range(num_graphs)]
+    processes = min(processes or os.cpu_count() or 1, num_graphs)
+    if processes == 1:
+        results = [_simulate_one(task) for task in tasks]
+    else:
+        with Pool(processes) as pool:
+            results = pool.map(_simulate_one, tasks, chunksize=max(1, num_graphs // (4 * processes)))
+    parents = np.stack([result[0] for result in results]).astype(np.int64)
+    directions = np.stack([result[1] for result in results]).astype(np.int64)
+    return torch.from_numpy(parents), torch.from_numpy(directions)
+
+
+def validate_dla(parents, directions) -> tuple[np.ndarray, np.ndarray]:
+    """Validate one ``(parents, directions)`` pair and return them as int64 arrays."""
+    parents = np.asarray(parents)
+    directions = np.asarray(directions)
+    if parents.ndim != 1 or parents.shape != directions.shape or len(parents) < 2:
+        raise ValueError("parents and directions must be equal-length 1D arrays of length >= 2")
+    if parents[0] != -1 or directions[0] != -1:
+        raise ValueError("the root must have parent -1 and direction -1")
+    ids = np.arange(1, len(parents))
+    if np.any(parents[1:] < 1) or np.any(parents[1:] > ids):
+        raise ValueError("node at index i must have a parent in 1..i")
+    if np.any(directions[1:] < 0) or np.any(directions[1:] > 3):
+        raise ValueError("directions must be in 0..3")
+    return parents.astype(np.int64, copy=False), directions.astype(np.int64, copy=False)
+
+
+def rebuild_positions(parents, directions) -> tuple[np.ndarray, int]:
+    """Place each node one step from its parent and count nodes landing on an occupied square.
+
+    Returns positions of shape (nodes, 2) with the root at (0, 0), and the collision count. A
+    colliding node keeps its position, so later nodes attached to it are placed as well.
+    """
+    parents, directions = validate_dla(parents, directions)
+    positions = np.zeros((len(parents), 2), dtype=np.int64)
+    occupied = {(0, 0)}
+    collisions = 0
+    for index in range(1, len(parents)):
+        positions[index] = positions[parents[index] - 1] + OFFSETS[directions[index]]
+        cell = (int(positions[index, 0]), int(positions[index, 1]))
+        if cell in occupied:
+            collisions += 1
+        occupied.add(cell)
+    return positions, collisions
+
+
 def parents_to_graph(
     parents: NDArray[np.int32], directions: NDArray[np.int8]
 ) -> np.ndarray[tuple[int, int], np.dtype[np.int32]]:
@@ -101,19 +165,12 @@ def parents_to_graph(
     Follows the BA parent-array convention: ``parents[i]`` is the 1-indexed
     arrival ID of node ``i + 1``'s parent, and ``parents[0]`` (the root) is unused.
     """
-    num_nodes = len(parents)
-    coordinates = np.zeros((num_nodes, 2), dtype=np.int32)
-    for index in range(1, num_nodes):
-        direction = directions[index]
-        if not 0 <= direction < 4:
-            raise ValueError(f"Invalid direction {direction}")
-        coordinates[index] = coordinates[parents[index] - 1] + OFFSETS[direction]
-
+    coordinates, collisions = rebuild_positions(parents, directions)
+    if collisions:
+        raise ValueError("two nodes occupy the same grid cell")
     # shift so the cluster starts at (0, 0); walks can go negative
     coordinates -= coordinates.min(axis=0)
     width, height = coordinates.max(axis=0) + 1
     grid = np.zeros((width, height), dtype=np.int32)
-    grid[coordinates[:, 0], coordinates[:, 1]] = np.arange(1, num_nodes + 1)
-    if np.count_nonzero(grid) != num_nodes:
-        raise ValueError("two nodes occupy the same grid cell")
+    grid[coordinates[:, 0], coordinates[:, 1]] = np.arange(1, len(parents) + 1)
     return grid
